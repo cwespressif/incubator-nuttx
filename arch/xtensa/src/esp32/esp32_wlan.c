@@ -119,6 +119,7 @@ struct esp_dev_s
 
   uint8_t alloc[CONFIG_ESP_ETH_NTXDESC*CONFIG_ESP_ETH_BUFSIZE];
   uint8_t rxbuf[ETH_MAX_LEN];
+  uint8_t txbuf[ETH_MAX_LEN];
   uint32_t rx_len;
 };
 
@@ -317,13 +318,27 @@ static int esp_transmit(FAR struct esp_dev_s *priv)
 
   buffer = priv->esp_dev.d_buf;
   buffer_len = priv->esp_dev.d_len;
-  ret = esp_wifi_sta_send_data(buffer, buffer_len);
 
-  if (ret != 0)
+  if (buffer_len > 0)
     {
-      wlerr("ERROR: Failed to transmit frame\n");
-      (void)wd_start(&priv->esp_txtimeout, ESP_TXTIMEOUT,
-                     esp_txtimeout_expiry, (uint32_t)priv);
+      ret = esp_wifi_sta_send_data(buffer, buffer_len);
+      if (ret != OK)
+        {
+          nxsig_usleep(10 * 1000);
+          wlerr("ERROR: Failed to transmit frame\n");
+          (void)wd_start(&priv->esp_txtimeout, ESP_TXTIMEOUT,
+                        esp_txtimeout_expiry, (uint32_t)priv);
+          return -EIO;
+        }
+      else
+        {
+          priv->esp_dev.d_buf = NULL;
+          priv->esp_dev.d_len = 0;
+        }
+    }
+  else
+    {
+      priv->esp_dev.d_buf = NULL;
       return -EIO;
     }
 
@@ -645,16 +660,8 @@ static void esp_rxpoll(FAR void *arg)
 {
   FAR struct esp_dev_s *priv = (FAR struct esp_dev_s *)arg;
 
-  if (priv->esp_dev.d_buf == NULL)
-    {
-      priv->esp_dev.d_buf = priv->rxbuf;
-      priv->esp_dev.d_len = priv->rx_len;
-    }
-  else
-    {
-      wlinfo("priv->esp_dev.d_buf != NULL");
-      return;
-    }
+  priv->esp_dev.d_buf = priv->rxbuf;
+  priv->esp_dev.d_len = priv->rx_len;
 
   /* Lock the network and serialize driver operations if necessary.
    * NOTE: Serialization is only required in the case where the driver work
@@ -666,14 +673,18 @@ static void esp_rxpoll(FAR void *arg)
 
   esp_receive(priv);
 
+  /* Check if a packet transmission just completed.  If so, call esp_txdone.
+   * This may disable further Tx interrupts if there are no pending
+   * transmissions.
+   */
+
+  net_unlock();
   if (priv->esp_dev.d_buf)
     {
       priv->esp_dev.d_buf = NULL;
       memset(priv->rxbuf, 0x0, sizeof(priv->rxbuf));
       priv->rx_len = 0;
     }
-
-  net_unlock();
 }
 
 /****************************************************************************
@@ -701,11 +712,7 @@ static void esp_dopoll(FAR struct esp_dev_s *priv)
 
   if (g_tx_ready == true)
     {
-      /* Check if there is room in the hardware to
-       * hold another outgoing packet.
-       */
-
-      dev->d_buf = esp_allocbuffer(priv);
+      dev->d_buf = priv->txbuf;
 
       /* We can't poll if we have no buffers */
 
@@ -713,21 +720,13 @@ static void esp_dopoll(FAR struct esp_dev_s *priv)
         {
           /* If so, then poll the network for new XMIT data */
 
-          (void)devif_poll(dev, esp_txpoll);
-
-          /* We will, most likely end up with a buffer to be freed.
-           * But it might not be the same one that we allocated above.
-           */
-
-          if (dev->d_buf)
+          int ret = devif_poll(dev, esp_txpoll);
+          if (ret == EBUSY)
             {
-              esp_freebuffer(priv, dev->d_buf);
-              dev->d_buf = NULL;
+              wlerr("ERROR: TX failed\r\n");
             }
-        }
-      else
-        {
-          wlerr("Alloc buffer error");
+
+          dev->d_buf = NULL;
         }
     }
   else
@@ -897,7 +896,7 @@ static void esp_poll_work(FAR void *arg)
 
   if (g_tx_ready == true)
     {
-      dev->d_buf = esp_allocbuffer(priv);
+      dev->d_buf = priv->txbuf;
 
       /* We can't poll if we have no buffers */
 
@@ -908,16 +907,6 @@ static void esp_poll_work(FAR void *arg)
            */
 
           (void)devif_timer(&priv->esp_dev, ESP_WDDELAY, esp_txpoll);
-
-          /* We will, most likely end up with a buffer to be freed.
-           * But it might not be the same one that we allocated above.
-           */
-
-          if (dev->d_buf)
-            {
-              esp_freebuffer(priv, dev->d_buf);
-              dev->d_buf = NULL;
-            }
         }
       else
         {
