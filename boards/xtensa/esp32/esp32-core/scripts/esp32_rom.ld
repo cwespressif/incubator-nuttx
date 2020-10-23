@@ -221,6 +221,7 @@ PROVIDE ( ets_unpack_flash_code = 0x40007018 );
 PROVIDE ( ets_unpack_flash_code_legacy = 0x4000694c );
 PROVIDE ( ets_update_cpu_frequency = 0x40008550 );
 PROVIDE ( ets_waiti0 = 0x400067d8 );
+PROVIDE ( intr_matrix_set = 0x4000681c );
 PROVIDE ( exc_cause_table = 0x3ff991d0 );
 PROVIDE ( _exit_r = 0x4000bd28 );
 PROVIDE ( __extendsfdf2 = 0x40002c34 );

@@ -82,13 +82,13 @@
 #endif
 
 #ifndef CONFIG_ESP_ETH_NTXDESC
-#  define CONFIG_ESP_ETH_NTXDESC   4
+#  define CONFIG_ESP_ETH_NTXDESC   32
 #endif
 
 /* We need at least one more free buffer than transmit buffers */
 
 #define ESP_ETH_NFREEBUFFERS (CONFIG_ESP_ETH_NTXDESC+1)
-#define ETH_MAX_LEN                1518
+#define ETH_MAX_LEN                1600
 
 /* This is a helper pointer for accessing the contents of wlan header */
 
@@ -179,6 +179,8 @@ static int  esp_rmmac(struct net_driver_s *dev, FAR const uint8_t *mac);
 static int  esp_ioctl(struct net_driver_s *dev, int cmd,
               unsigned long arg);
 #endif
+static void esp_sta_output(uint8_t ifidx, uint8_t *data,
+                           uint16_t *len, bool txstatus);
 static int esp32_net_initialize(unsigned int devno);
 
 /****************************************************************************
@@ -313,6 +315,7 @@ static int esp_transmit(FAR struct esp_dev_s *priv)
   int ret = 0;
   uint8_t *buffer;
   uint32_t buffer_len;
+  static int count = 1;
 
   /* Set up all but the last TX descriptor */
 
@@ -324,16 +327,20 @@ static int esp_transmit(FAR struct esp_dev_s *priv)
       ret = esp_wifi_sta_send_data(buffer, buffer_len);
       if (ret != OK)
         {
-          nxsig_usleep(10 * 1000);
+          if (ret == 0x101)
+            {
+              nxsig_usleep(10 * 1000);
+              ret = esp_wifi_sta_send_data(buffer, buffer_len);
+              if (ret == OK)
+                {
+                  return OK;
+                }
+            }
+
           wlerr("ERROR: Failed to transmit frame\n");
           (void)wd_start(&priv->esp_txtimeout, ESP_TXTIMEOUT,
                         esp_txtimeout_expiry, (uint32_t)priv);
           return -EIO;
-        }
-      else
-        {
-          priv->esp_dev.d_buf = NULL;
-          priv->esp_dev.d_len = 0;
         }
     }
   else
@@ -1319,6 +1326,45 @@ static int esp_ioctl(FAR struct net_driver_s *dev,
 #endif  /* CONFIG_NETDEV_IOCTL */
 
 /****************************************************************************
+ * Name: esp_sta_output
+ *
+ * Description:
+ *   TxDone callback function type.
+ *
+ * Input Parameters:
+ *   ifidx  - The interface id that the tx callback has been triggered from.
+ *   data   - Pointer to the data transmitted.
+ *   len    - Length of the data transmitted.
+ *   status - True if data was transmitted sucessfully or false if failed.
+ *
+ * Returned Value:
+ *   None
+ *
+ ****************************************************************************/
+
+static void esp_sta_output(uint8_t ifidx, uint8_t *data,
+                           uint16_t *len, bool status)
+{
+  FAR struct esp_dev_s *priv;
+  uint16_t msecs = 0;
+  static uint16_t retry = 0;
+  priv = &s_esp32_dev;
+
+  if (status == false)
+    {
+      retry++;
+      msecs = (uint16_t)((retry < 4 ? 1 << retry : 10) * 1000);
+      nxsig_usleep((msecs + 8) * 1000);
+    }
+  else
+    {
+      retry = 0;
+      esp_txavail(&priv->esp_dev);
+    }
+
+}
+
+/****************************************************************************
  * Name: esp32_net_initialize
  *
  * Description:
@@ -1370,6 +1416,7 @@ static int esp32_net_initialize(unsigned int devno)
 
   assert(esp_wifi_adapter_init() == 0);
   esp_wifi_sta_register_recv_cb(esp_sta_input);
+  esp_wifi_sta_register_tx_done_cb(esp_sta_output);
 
   /* Register the device with the OS so that socket IOCTLs can be performed */
 

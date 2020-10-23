@@ -113,6 +113,10 @@ else
   LDFLAGS += -Map=$(TOPDIR)/nuttx.map --cref
 endif
 
+# Due to some Wi-Fi related libraries, the option is need to avoid linking too much
+# unused functions.
+LDFLAGS += --gc-sections
+
 ifeq ($(CONFIG_DEBUG_SYMBOLS),y)
   LDFLAGS += -g
 endif

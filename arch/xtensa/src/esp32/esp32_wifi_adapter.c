@@ -142,9 +142,15 @@ struct nvs_adpt
  * Private Function Prototypes
  ****************************************************************************/
 
+static bool IRAM_ATTR esp_env_is_chip_wrapper(void);
+static void set_intr_wrapper(int32_t cpu_no, uint32_t intr_source,
+                             uint32_t intr_num, int32_t intr_prio);
+static void clear_intr_wrapper(uint32_t intr_source, uint32_t intr_num);
+
 static void esp_set_isr(int32_t n, void *f, void *arg);
 static void esp32_ints_on(uint32_t mask);
 static void esp32_ints_off(uint32_t mask);
+static bool IRAM_ATTR is_from_isr_wrapper(void);
 static void *esp_spin_lock_create(void);
 static void esp_spin_lock_delete(void *lock);
 static uint32_t esp_wifi_int_disable(void *wifi_int_mux);
@@ -200,10 +206,13 @@ static void *esp_malloc(uint32_t size);
 static uint32_t esp_rand(void);
 static void esp_dport_access_stall_other_cpu_start(void);
 static void esp_dport_access_stall_other_cpu_end(void);
-static int32_t esp_phy_deinit_rf(uint32_t module);
-static void esp_phy_init(uint32_t module);
+static void IRAM_ATTR wifi_apb80m_request_wrapper(void);
+static void IRAM_ATTR wifi_apb80m_release_wrapper(void);
+static void esp_phy_disable(void);
+static void esp_phy_enable(void);
 static void esp_phy_enable_clock(void);
 static void esp_phy_disable_clock(void);
+static int32_t esp_phy_update_country_info(const char *country);
 static int32_t esp_wifi_read_mac(uint8_t *mac, uint32_t type);
 static void esp_timer_arm(void *timer, uint32_t tmout, bool repeat);
 static void esp_timer_disarm(void *timer);
@@ -211,8 +220,10 @@ static void esp32_timer_done(void *timer);
 static void esp_timer_setfn(void *timer, void *pfunction, void *parg);
 static void esp_timer_cb(wdparm_t parm);
 static void esp_timer_arm_us(void *timer, uint32_t us, bool repeat);
-static void esp_periph_module_enable(uint32_t periph);
-static void esp_periph_module_disable(uint32_t periph);
+static void wifi_reset_mac_wrapper(void);
+static void wifi_clock_enable_wrapper(void);
+static void wifi_clock_disable_wrapper(void);
+static void IRAM_ATTR esp_empty_wrapper(void);
 static int32_t esp_nvs_set_i8(uint32_t handle, const char *key,
                               int8_t value);
 static int32_t esp_nvs_get_i8(uint32_t handle, const char *key,
@@ -246,17 +257,31 @@ static void *esp_wifi_malloc(size_t size);
 static void *esp_wifi_realloc(void *ptr, size_t size);
 static void *esp_wifi_calloc(size_t n, size_t size);
 static void *esp_wifi_zalloc(size_t size);
-static int32_t esp_modem_enter_sleep(uint32_t module);
-static int32_t esp_modem_exit_sleep(uint32_t module);
-static int32_t esp_modem_register_sleep(uint32_t module);
-static int32_t esp_modem_deregister_sleep(uint32_t module);
 static void *esp_wifi_create_queue(int32_t queue_len, int32_t item_size);
 static void esp_wifi_delete_queue(void *queue);
+static int coex_init_wrapper(void);
+static void coex_deinit_wrapper(void);
+static int coex_enable_wrapper(void);
+static void coex_disable_wrapper(void);
 static uint32_t esp_coex_status_get(void);
 static void esp_coex_condition_set(uint32_t type, bool dissatisfy);
 static int32_t esp_coex_wifi_request(uint32_t event, uint32_t latency,
                                      uint32_t duration);
 static int32_t esp_coex_wifi_release(uint32_t event);
+static int coex_wifi_channel_set_wrapper(uint8_t primary, uint8_t secondary);
+static IRAM_ATTR int coex_event_duration_get_wrapper(uint32_t event,
+                                                     uint32_t *duration);
+static int coex_pti_get_wrapper(uint32_t event, uint8_t *pti);
+static void coex_schm_status_bit_clear_wrapper(uint32_t type,
+                                               uint32_t status);
+static void coex_schm_status_bit_set_wrapper(uint32_t type,
+                                             uint32_t status);
+static IRAM_ATTR int coex_schm_interval_set_wrapper(uint32_t interval);
+static uint32_t coex_schm_interval_get_wrapper(void);
+static uint8_t coex_schm_curr_period_get_wrapper(void);
+static void * coex_schm_curr_phase_get_wrapper(void);
+static int coex_schm_curr_phase_idx_set_wrapper(int idx);
+static int coex_schm_curr_phase_idx_get_wrapper(void);
 
 /****************************************************************************
  * Public Functions declaration
@@ -283,13 +308,15 @@ static bool s_wifi_tkey_init;
 
 /* WiFi sleep private data */
 
-static uint32_t s_esp32_module_mask;
-static uint32_t s_esp32_module_sleep;
-static bool s_esp32_sleep;
 static uint32_t s_phy_clk_en_cnt = 0;
-static bool s_esp23_phy_en;
-static uint32_t s_esp32_phy_init_mask;
-static int64_t s_esp32_phy_rf_stop_tm;
+
+/* Reference count of enabling PHY */
+
+static uint8_t s_phy_access_ref = 0;
+
+/* time stamp updated when the PHY/RF is turned on */
+
+static int64_t s_phy_rf_en_ts = 0;
 
 /* WiFi event private data */
 
@@ -304,6 +331,10 @@ static uint8_t s_password[64];
 static uint8_t s_ssid_len;
 static uint8_t s_password_len;
 
+/* Callback function to update WiFi MAC time */
+
+wifi_mac_time_update_cb_t s_wifi_mac_time_update_cb = NULL;
+
 /****************************************************************************
  * Public Data
  ****************************************************************************/
@@ -313,9 +344,13 @@ static uint8_t s_password_len;
 wifi_osi_funcs_t g_wifi_osi_funcs =
 {
   ._version = ESP_WIFI_OS_ADAPTER_VERSION,
+  ._env_is_chip = esp_env_is_chip_wrapper,
+  ._set_intr = set_intr_wrapper,
+  ._clear_intr = clear_intr_wrapper,
   ._set_isr = esp_set_isr,
   ._ints_on = esp32_ints_on,
   ._ints_off = esp32_ints_off,
+  ._is_from_isr = is_from_isr_wrapper,
   ._spin_lock_create = esp_spin_lock_create,
   ._spin_lock_delete = esp_spin_lock_delete,
   ._wifi_int_disable = esp_wifi_int_disable,
@@ -360,18 +395,24 @@ wifi_osi_funcs_t g_wifi_osi_funcs =
       esp_dport_access_stall_other_cpu_start,
   ._dport_access_stall_other_cpu_end_wrap =
       esp_dport_access_stall_other_cpu_end,
-  ._phy_rf_deinit = esp_phy_deinit_rf,
-  ._phy_load_cal_and_init = esp_phy_init,
+  ._wifi_apb80m_request = wifi_apb80m_request_wrapper,
+  ._wifi_apb80m_release = wifi_apb80m_release_wrapper,
+  ._phy_disable = esp_phy_disable,
+  ._phy_enable = esp_phy_enable,
   ._phy_common_clock_enable = esp_phy_enable_clock,
   ._phy_common_clock_disable = esp_phy_disable_clock,
+  ._phy_update_country_info = esp_phy_update_country_info,
   ._read_mac = esp_wifi_read_mac,
   ._timer_arm = esp_timer_arm,
   ._timer_disarm = esp_timer_disarm,
   ._timer_done = esp32_timer_done,
   ._timer_setfn = esp_timer_setfn,
   ._timer_arm_us = esp_timer_arm_us,
-  ._periph_module_enable = esp_periph_module_enable,
-  ._periph_module_disable = esp_periph_module_disable,
+  ._wifi_reset_mac = wifi_reset_mac_wrapper,
+  ._wifi_clock_enable = wifi_clock_enable_wrapper,
+  ._wifi_clock_disable = wifi_clock_disable_wrapper,
+  ._wifi_rtc_enable_iso = esp_empty_wrapper,
+  ._wifi_rtc_disable_iso = esp_empty_wrapper,
   ._esp_timer_get_time = esp_timer_get_time,
   ._nvs_set_i8 = esp_nvs_set_i8,
   ._nvs_get_i8 = esp_nvs_get_i8,
@@ -401,14 +442,25 @@ wifi_osi_funcs_t g_wifi_osi_funcs =
   ._wifi_zalloc = esp_wifi_zalloc,
   ._wifi_create_queue = esp_wifi_create_queue,
   ._wifi_delete_queue = esp_wifi_delete_queue,
-  ._modem_sleep_enter = esp_modem_enter_sleep,
-  ._modem_sleep_exit = esp_modem_exit_sleep,
-  ._modem_sleep_register = esp_modem_register_sleep,
-  ._modem_sleep_deregister = esp_modem_deregister_sleep,
+  ._coex_init = coex_init_wrapper,
+  ._coex_deinit = coex_deinit_wrapper,
+  ._coex_enable = coex_enable_wrapper,
+  ._coex_disable = coex_disable_wrapper,
   ._coex_status_get = esp_coex_status_get,
   ._coex_condition_set = esp_coex_condition_set,
   ._coex_wifi_request = esp_coex_wifi_request,
   ._coex_wifi_release = esp_coex_wifi_release,
+  ._coex_wifi_channel_set = coex_wifi_channel_set_wrapper,
+  ._coex_event_duration_get = coex_event_duration_get_wrapper,
+  ._coex_pti_get = coex_pti_get_wrapper,
+  ._coex_schm_status_bit_clear = coex_schm_status_bit_clear_wrapper,
+  ._coex_schm_status_bit_set = coex_schm_status_bit_set_wrapper,
+  ._coex_schm_interval_set = coex_schm_interval_set_wrapper,
+  ._coex_schm_interval_get = coex_schm_interval_get_wrapper,
+  ._coex_schm_curr_period_get = coex_schm_curr_period_get_wrapper,
+  ._coex_schm_curr_phase_get = coex_schm_curr_phase_get_wrapper,
+  ._coex_schm_curr_phase_idx_set = coex_schm_curr_phase_idx_set_wrapper,
+  ._coex_schm_curr_phase_idx_get = coex_schm_curr_phase_idx_get_wrapper,
   ._magic = ESP_WIFI_OS_ADAPTER_MAGIC,
 };
 
@@ -423,6 +475,11 @@ ESP_EVENT_DEFINE_BASE(WIFI_EVENT);
 /****************************************************************************
  * Private Functions and Public Functions only used by libraries
  ****************************************************************************/
+
+/* Attach an CPU interrupt to a hardware source. */
+
+extern void intr_matrix_set(int cpu_no,
+                            uint32_t model_num, uint32_t intr_num);
 
 /****************************************************************************
  * Name: esp_errno_trans
@@ -619,6 +676,11 @@ static void esp32_ints_on(uint32_t mask)
 static void esp32_ints_off(uint32_t mask)
 {
   up_disable_irq(s_wifi_irq);
+}
+
+static bool IRAM_ATTR is_from_isr_wrapper(void)
+{
+  return up_interrupt_context();
 }
 
 /****************************************************************************
@@ -1650,7 +1712,7 @@ static void esp_task_delay(uint32_t tick)
 {
   useconds_t us = TICK2USEC(tick);
 
-  usleep(us);
+  nxsig_usleep(us);
 }
 
 /****************************************************************************
@@ -1852,6 +1914,61 @@ static void esp_evt_work_cb(FAR void *arg)
 }
 
 /****************************************************************************
+ * Name: esp_env_is_chip_wrapper
+ *
+ * Description:
+ *   Config chip environment
+ *
+ * Returned Value:
+ *   True if on FPGA or false if not.
+ *
+ ****************************************************************************/
+
+static bool IRAM_ATTR esp_env_is_chip_wrapper(void)
+{
+#ifdef CONFIG_IDF_ENV_FPGA
+    return false;
+#else
+    return true;
+#endif
+}
+
+/****************************************************************************
+ * Name: set_intr_wrapper
+ *
+ * Description:
+ *   Attach an CPU interrupt to a hardware source.
+ *
+ * Input Parameters:
+ *     cpu_no      - The CPU which the interrupt number belongs.
+ *     intr_source - The interrupt hardware source number.
+ *     intr_num    - The interrupt number CPU.
+ *     intr_prio   - The interrupt priority.
+ *
+ * Returned Value:
+ *     None
+ *
+ ****************************************************************************/
+
+static void set_intr_wrapper(int32_t cpu_no, uint32_t intr_source,
+                             uint32_t intr_num, int32_t intr_prio)
+{
+  intr_matrix_set(cpu_no, intr_source, intr_num);
+}
+
+/****************************************************************************
+ * Name: clear_intr_wrapper
+ *
+ * Description:
+ *   Don't support
+ *
+ ****************************************************************************/
+
+static void clear_intr_wrapper(uint32_t intr_source, uint32_t intr_num)
+{
+}
+
+/****************************************************************************
  * Name: esp_event_post
  *
  * Description:
@@ -1970,160 +2087,115 @@ static void esp_dport_access_stall_other_cpu_end(void)
 }
 
 /****************************************************************************
- * Name: esp_phy_rf_init
+ * Name: wifi_apb80m_request_wrapper
  *
  * Description:
- *   Initialize PHY hardware with given parameters
- *
- * Input Parameters:
- *   init_data        - PHY hardware initialization parameters
- *   mode             - PHY RF calculation mode
- *   calibration_data - PHY RF calculation parameters
- *   module           - PHY mode which is to be initialized
- *
- * Returned Value:
- *   0 if success or -1 if fail
+ *   Don't support
  *
  ****************************************************************************/
 
-int32_t esp_phy_rf_init(const esp_phy_init_data_t *init_data,
-                        esp_phy_calibration_mode_t mode,
-                        esp_phy_calibration_data_t *calibration_data,
-                        phy_rf_module_t module)
+static void IRAM_ATTR wifi_apb80m_request_wrapper(void)
 {
-  irqstate_t flags;
-  int64_t time;
-  bool enable = false;
-
-  if (module >= PHY_MODULE_COUNT)
-    {
-      return -1;
-    }
-
-  flags = enter_critical_section();
-
-  s_esp32_phy_init_mask |= 1 << module;
-
-  if (s_esp23_phy_en)
-    {
-      leave_critical_section(flags);
-      return 0;
-    }
-
-  if (module == PHY_MODEM_MODULE)
-    {
-      if (s_esp32_phy_init_mask & PHY_RF_MASK)
-        {
-          enable = true;
-        }
-    }
-  else if (module == PHY_WIFI_MODULE || module == PHY_BT_MODULE)
-    {
-      enable = true;
-    }
-
-  if (enable)
-    {
-      if (s_esp32_phy_rf_stop_tm)
-        {
-          time = esp_timer_get_time() - s_esp32_phy_rf_stop_tm;
-          esp_wifi_internal_update_mac_time((uint32_t)time);
-          s_esp32_phy_rf_stop_tm = 0;
-        }
-
-      esp_phy_enable_clock();
-
-      phy_set_wifi_mode_only(0);
-
-      register_chipv7_phy(init_data, calibration_data, mode);
-
-      s_esp23_phy_en = true;
-    }
-
-  leave_critical_section(flags);
-
-  return 0;
 }
 
 /****************************************************************************
- * Name: esp_phy_deinit_rf
+ * Name: wifi_apb80m_release_wrapper
+ *
+ * Description:
+ *   Don't support
+ *
+ ****************************************************************************/
+
+static void IRAM_ATTR wifi_apb80m_release_wrapper(void)
+{
+}
+
+static inline void phy_update_wifi_mac_time(bool en_clock_stopped,
+                                            int64_t now)
+{
+  uint32_t diff;
+  static uint32_t s_common_clock_disable_time = 0;
+
+  if (en_clock_stopped)
+    {
+      s_common_clock_disable_time = (uint32_t)now;
+    }
+  else
+    {
+      if (s_common_clock_disable_time)
+        {
+          diff = (uint64_t)now - s_common_clock_disable_time;
+
+          if (s_wifi_mac_time_update_cb)
+            {
+              s_wifi_mac_time_update_cb(diff);
+            }
+
+          s_common_clock_disable_time = 0;
+        }
+    }
+}
+
+/****************************************************************************
+ * Name: esp_phy_enable
  *
  * Description:
  *   Deinitialize PHY hardware
  *
  * Input Parameters:
- *   module - PHY mode which is to be deinitialized
- *
- * Returned Value:
- *   0 if success or -1 if fail
- *
- ****************************************************************************/
-
-static int32_t esp_phy_deinit_rf(uint32_t module)
-{
-  irqstate_t flags;
-  bool disable = false;
-
-  if (module >= PHY_MODULE_COUNT)
-    {
-      return -1;
-    }
-
-  flags = enter_critical_section();
-
-  s_esp32_phy_init_mask |= ~(1 << module);
-
-  if (!s_esp23_phy_en)
-    {
-      leave_critical_section(flags);
-      return 0;
-    }
-
-  if (module == PHY_MODEM_MODULE)
-    {
-      disable = true;
-    }
-  else if (module == PHY_WIFI_MODULE || module == PHY_BT_MODULE)
-    {
-      if (!(s_esp32_phy_init_mask & PHY_RF_MASK))
-        {
-          disable = true;
-        }
-    }
-
-  if (disable)
-    {
-      phy_close_rf();
-
-      s_esp32_phy_rf_stop_tm = esp_timer_get_time();
-
-      esp_phy_disable_clock();
-
-      s_esp23_phy_en = false;
-    }
-
-  leave_critical_section(flags);
-
-  return 0;
-}
-
-/****************************************************************************
- * Name: esp_phy_init
- *
- * Description:
- *   Initialize PHY hardware
- *
- * Input Parameters:
- *   module - PHY mode which is to be initialized
+ *   None
  *
  * Returned Value:
  *   None
  *
  ****************************************************************************/
 
-static void esp_phy_init(uint32_t module)
+static void esp_phy_disable(void)
 {
-  int ret;
+  irqstate_t flags;
+  flags = enter_critical_section();
+
+  s_phy_access_ref--;
+
+  if (s_phy_access_ref == 0)
+    {
+      /* Disable PHY and RF. */
+
+      phy_close_rf();
+
+      /* Update WiFi MAC time before disalbe
+       * WiFi/BT common peripheral clock.
+       */
+
+      phy_update_wifi_mac_time(true, esp_timer_get_time());
+
+      /* Disable WiFi/BT common peripheral clock.
+       * Do not disable clock for hardware RNG.
+       */
+
+      esp_phy_disable_clock();
+    }
+
+  leave_critical_section(flags);
+}
+
+/****************************************************************************
+ * Name: esp_phy_enable
+ *
+ * Description:
+ *   Initialize PHY hardware
+ *
+ * Input Parameters:
+ *   None
+ *
+ * Returned Value:
+ *   None
+ *
+ ****************************************************************************/
+
+static void esp_phy_enable(void)
+{
+  irqstate_t flags;
   esp_phy_calibration_data_t *cal_data;
 
   cal_data = kmm_zalloc(sizeof(esp_phy_calibration_data_t));
@@ -2133,13 +2205,24 @@ static void esp_phy_init(uint32_t module)
       DEBUGASSERT(0);
     }
 
-  ret = esp_phy_rf_init(&phy_init_data, PHY_RF_CAL_FULL, cal_data, module);
-  if (ret)
+  flags = enter_critical_section();
+
+  if (s_phy_access_ref == 0)
     {
-      wlerr("ERROR: Failed to initialize RF");
-      DEBUGASSERT(0);
+      /* Update time stamp */
+
+      s_phy_rf_en_ts = esp_timer_get_time();
+
+      /* Update WiFi MAC time before WiFi/BT common clock is enabled */
+
+      phy_update_wifi_mac_time(false, s_phy_rf_en_ts);
+      esp_phy_enable_clock();
+      phy_set_wifi_mode_only(0);
+      register_chipv7_phy(&phy_init_data, cal_data, PHY_RF_CAL_NONE);
     }
 
+  s_phy_access_ref++;
+  leave_critical_section(flags);
   kmm_free(cal_data);
 }
 
@@ -2206,6 +2289,19 @@ void esp_phy_disable_clock(void)
     }
 
   leave_critical_section(flags);
+}
+
+/****************************************************************************
+ * Name: esp_phy_update_country_info
+ *
+ * Description:
+ *   Don't support
+ *
+ ****************************************************************************/
+
+static int32_t esp_phy_update_country_info(const char *country)
+{
+  return 0;
 }
 
 /****************************************************************************
@@ -2508,42 +2604,60 @@ static void esp_timer_arm_us(void *ptimer, uint32_t us, bool repeat)
     }
 }
 
+static void wifi_reset_mac_wrapper(void)
+{
+  modifyreg32(DPORT_WIFI_RST_EN_REG, 0, DPORT_MAC_RST_EN);
+  modifyreg32(DPORT_WIFI_RST_EN_REG, DPORT_MAC_RST_EN, 0);
+}
+
 /****************************************************************************
- * Name: esp_periph_module_enable
+ * Name: wifi_clock_enable_wrapper
  *
  * Description:
- *   Enable WiFi module clock
+ *   Enable Wi-Fi clock
  *
  * Input Parameters:
- *   periph - No mean
+ *   None
  *
  * Returned Value:
  *   None
  *
  ****************************************************************************/
 
-static void esp_periph_module_enable(uint32_t periph)
+static void wifi_clock_enable_wrapper(void)
 {
   modifyreg32(DPORT_WIFI_CLK_EN_REG, 0, DPORT_WIFI_CLK_WIFI_EN_M);
 }
 
 /****************************************************************************
- * Name: esp_periph_module_enable
+ * Name: wifi_clock_disable_wrapper
  *
  * Description:
- *   Disable WiFi module clock
+ *   Disable Wi-Fi clock
  *
  * Input Parameters:
- *   periph - No mean
+ *   None
  *
  * Returned Value:
  *   None
  *
  ****************************************************************************/
 
-static void esp_periph_module_disable(uint32_t periph)
+static void wifi_clock_disable_wrapper(void)
 {
   modifyreg32(DPORT_WIFI_CLK_EN_REG, DPORT_WIFI_CLK_WIFI_EN_M, 0);
+}
+
+/****************************************************************************
+ * Name: esp_empty_wrapper
+ *
+ * Description:
+ *   Don't support
+ *
+ ****************************************************************************/
+
+static void IRAM_ATTR esp_empty_wrapper(void)
+{
 }
 
 /****************************************************************************
@@ -3457,211 +3571,45 @@ static void esp_wifi_delete_queue(void *queue)
 }
 
 /****************************************************************************
- * Name: esp_modem_enter_sleep
+ * Name: coex_init_wrapper
  *
  * Description:
- *   Let given module to enter sleep mode
- *
- * Input Parameters:
- *   module - hardware module ID
- *
- * Returned Value:
- *   0 if success or -1 if fail
+ *   Don't support
  *
  ****************************************************************************/
 
-static int32_t esp_modem_enter_sleep(uint32_t module)
+static int coex_init_wrapper(void)
 {
-  int ret = 0;
-  irqstate_t flags;
-  uint32_t bit;
-
-  if (module >= (uint32_t)MODEM_MODULE_COUNT)
-    {
-      return -1;
-    }
-
-  bit = 1 << module;
-
-  if (!(s_esp32_module_mask & bit))
-    {
-      return -1;
-    }
-
-  flags = enter_critical_section();
-
-  s_esp32_module_sleep |= bit;
-  if (!s_esp32_sleep && (s_esp32_module_sleep == s_esp32_module_mask))
-    {
-      ret = esp_phy_deinit_rf(PHY_MODEM_MODULE);
-      if (ret)
-        {
-          wlerr("ERROR: Failed to close RF\n");
-        }
-      else
-        {
-          s_esp32_sleep = true;
-        }
-    }
-
-  leave_critical_section(flags);
-
-  return ret;
-}
-
-/****************************************************************************
- * Name: esp_modem_enter_sleep
- *
- * Description:
- *   Let given module to exit from sleep mode
- *
- * Input Parameters:
- *   module - hardware module ID
- *
- * Returned Value:
- *   0 if success or -1 if fail
- *
- ****************************************************************************/
-
-static int32_t esp_modem_exit_sleep(uint32_t module)
-{
-  int ret = 0;
-  irqstate_t flags;
-  uint32_t bit;
-
-  if (module >= (uint32_t)MODEM_MODULE_COUNT)
-    {
-      return -1;
-    }
-
-  bit = 1 << module;
-
-  if (!(s_esp32_module_mask & bit))
-    {
-      return -1;
-    }
-
-  flags = enter_critical_section();
-
-  s_esp32_module_sleep &= ~bit;
-  if (s_esp32_sleep)
-    {
-      ret = esp_phy_rf_init(NULL, PHY_RF_CAL_NONE,
-                            NULL, PHY_MODEM_MODULE);
-      if (ret)
-        {
-          wlerr("ERROR: Failed to open RF\n");
-        }
-      else
-        {
-          s_esp32_sleep = false;
-        }
-    }
-
-  leave_critical_section(flags);
-
-  return ret;
-}
-
-/****************************************************************************
- * Name: esp_modem_register_sleep
- *
- * Description:
- *   Regitser given module so that it can enter sleep mode
- *
- * Input Parameters:
- *   module - hardware module ID
- *
- * Returned Value:
- *   0 if success or -1 if fail
- *
- ****************************************************************************/
-
-static int32_t esp_modem_register_sleep(uint32_t module)
-{
-  irqstate_t flags;
-  uint32_t bit;
-
-  if (module >= (uint32_t)MODEM_MODULE_COUNT)
-    {
-      return -1;
-    }
-
-  bit = 1 << module;
-
-  flags = enter_critical_section();
-
-  if (s_esp32_module_mask & bit)
-    {
-      /* Has registered and return success */
-
-      return 0;
-    }
-
-  s_esp32_module_mask |= bit;
-  s_esp32_module_sleep |= bit;
-
-  leave_critical_section(flags);
-
   return 0;
 }
 
 /****************************************************************************
- * Name: esp_modem_deregister_sleep
+ * Name: coex_deinit_wrapper
  *
  * Description:
- *   Deregitser given module so that it can't enter sleep mode
- *
- * Input Parameters:
- *   module - hardware module ID
- *
- * Returned Value:
- *   0 if success or -1 if fail
+ *   Don't support
  *
  ****************************************************************************/
 
-static int32_t esp_modem_deregister_sleep(uint32_t module)
+static void coex_deinit_wrapper(void)
 {
-  int ret;
-  irqstate_t flags;
-  uint32_t bit;
+}
 
-  if (module >= (uint32_t)MODEM_MODULE_COUNT)
-    {
-      return -1;
-    }
-
-  bit = 1 << module;
-
-  flags = enter_critical_section();
-
-  if (!(s_esp32_module_mask & bit))
-    {
-      /* Has deregistered and return success */
-
-      return 0;
-    }
-
-  s_esp32_module_mask &= ~bit;
-  s_esp32_module_sleep &= ~bit;
-  if (!s_esp32_module_mask)
-    {
-      s_esp32_module_mask = 0;
-      if (s_esp32_sleep)
-        {
-          s_esp32_sleep = false;
-          ret = esp_phy_rf_init(NULL, PHY_RF_CAL_NONE,
-                                NULL, PHY_MODEM_MODULE);
-          if (ret)
-            {
-              wlerr("ERROR: Failed to open RF\n");
-            }
-        }
-    }
-
-  leave_critical_section(flags);
-
+static int coex_enable_wrapper(void)
+{
   return 0;
+}
+
+/****************************************************************************
+ * Name: coex_disable_wrapper
+ *
+ * Description:
+ *   Don't support
+ *
+ ****************************************************************************/
+
+static void coex_disable_wrapper(void)
+{
 }
 
 /****************************************************************************
@@ -3712,6 +3660,149 @@ static int32_t esp_coex_wifi_request(uint32_t event, uint32_t latency,
  ****************************************************************************/
 
 static int32_t esp_coex_wifi_release(uint32_t event)
+{
+  return 0;
+}
+
+/****************************************************************************
+ * Name: coex_wifi_channel_set_wrapper
+ *
+ * Description:
+ *   Don't support
+ *
+ ****************************************************************************/
+
+static int coex_wifi_channel_set_wrapper(uint8_t primary, uint8_t secondary)
+{
+  return 0;
+}
+
+/****************************************************************************
+ * Name: coex_event_duration_get_wrapper
+ *
+ * Description:
+ *   Don't support
+ *
+ ****************************************************************************/
+
+static IRAM_ATTR int coex_event_duration_get_wrapper(uint32_t event,
+                                                     uint32_t *duration)
+{
+  return 0;
+}
+
+/****************************************************************************
+ * Name: coex_pti_get_wrapper
+ *
+ * Description:
+ *   Don't support
+ *
+ ****************************************************************************/
+
+static int coex_pti_get_wrapper(uint32_t event, uint8_t *pti)
+{
+  return 0;
+}
+
+/****************************************************************************
+ * Name: coex_schm_status_bit_clear_wrapper
+ *
+ * Description:
+ *   Don't support
+ *
+ ****************************************************************************/
+
+static void coex_schm_status_bit_clear_wrapper(uint32_t type,
+                                               uint32_t status)
+{
+}
+
+/****************************************************************************
+ * Name: coex_schm_status_bit_set_wrapper
+ *
+ * Description:
+ *   Don't support
+ *
+ ****************************************************************************/
+
+static void coex_schm_status_bit_set_wrapper(uint32_t type, uint32_t status)
+{
+}
+
+/****************************************************************************
+ * Name: coex_schm_interval_set_wrapper
+ *
+ * Description:
+ *   Don't support
+ *
+ ****************************************************************************/
+
+static IRAM_ATTR int coex_schm_interval_set_wrapper(uint32_t interval)
+{
+  return 0;
+}
+
+/****************************************************************************
+ * Name: coex_schm_interval_get_wrapper
+ *
+ * Description:
+ *   Don't support
+ *
+ ****************************************************************************/
+
+static uint32_t coex_schm_interval_get_wrapper(void)
+{
+  return 0;
+}
+
+/****************************************************************************
+ * Name: coex_schm_curr_period_get_wrapper
+ *
+ * Description:
+ *   Don't support
+ *
+ ****************************************************************************/
+
+static uint8_t coex_schm_curr_period_get_wrapper(void)
+{
+  return 0;
+}
+
+/****************************************************************************
+ * Name: coex_schm_curr_phase_get_wrapper
+ *
+ * Description:
+ *   Don't support
+ *
+ ****************************************************************************/
+
+static void * coex_schm_curr_phase_get_wrapper(void)
+{
+  return NULL;
+}
+
+/****************************************************************************
+ * Name: coex_schm_curr_phase_idx_set_wrapper
+ *
+ * Description:
+ *   Don't support
+ *
+ ****************************************************************************/
+
+static int coex_schm_curr_phase_idx_set_wrapper(int idx)
+{
+  return 0;
+}
+
+/****************************************************************************
+ * Name: coex_schm_curr_phase_idx_get_wrapper
+ *
+ * Description:
+ *   Don't support
+ *
+ ****************************************************************************/
+
+static int coex_schm_curr_phase_idx_get_wrapper(void)
 {
   return 0;
 }
@@ -4062,6 +4153,8 @@ int32_t esp_wifi_init(const wifi_init_config_t *config)
       wlerr("ERROR: Failed to initialize WiFi error=%d\n", ret);
       return -1;
     }
+
+  s_wifi_mac_time_update_cb = esp_wifi_internal_update_mac_time;
 
   ret = esp_supplicant_init();
   if (ret)
@@ -4426,5 +4519,38 @@ int esp_wifi_connect_internal(void)
       return -1;
     }
 
+  return 0;
+}
+
+/****************************************************************************
+ * Name: esp_wifi_sta_register_tx_done_cb
+ *
+ * Description:
+ *   Register the txDone callback function of type wifi_tx_done_cb_t
+ *
+ * Input Parameters:
+ *   callback - The callback function
+ *
+ * Returned Value:
+ *   0 if success or -1 if fail
+ *
+ ****************************************************************************/
+
+int esp_wifi_sta_register_tx_done_cb(void *callback)
+{
+  return esp_wifi_set_tx_done_cb((wifi_tx_done_cb_t)callback);
+}
+
+/****************************************************************************
+ * Name: esp_mesh_send_event_internal
+ *
+ * Description:
+ *   Don't support
+ *
+ ****************************************************************************/
+
+int esp_mesh_send_event_internal(int32_t event_id,
+            void *event_data, size_t event_data_size)
+{
   return 0;
 }
