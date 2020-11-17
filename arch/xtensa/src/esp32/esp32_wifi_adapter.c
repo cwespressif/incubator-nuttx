@@ -208,11 +208,11 @@ static void esp_dport_access_stall_other_cpu_start(void);
 static void esp_dport_access_stall_other_cpu_end(void);
 static void IRAM_ATTR wifi_apb80m_request_wrapper(void);
 static void IRAM_ATTR wifi_apb80m_release_wrapper(void);
-static void esp_phy_disable(void);
-static void esp_phy_enable(void);
+static void esp_phy_disable_wrapper(void);
+static void esp_phy_enable_wrapper(void);
 static void esp_phy_enable_clock(void);
 static void esp_phy_disable_clock(void);
-static int32_t esp_phy_update_country_info(const char *country);
+static int32_t esp_phy_update_country_info_wrapper(const char *country);
 static int32_t esp_wifi_read_mac(uint8_t *mac, uint32_t type);
 static void esp_timer_arm(void *timer, uint32_t tmout, bool repeat);
 static void esp_timer_disarm(void *timer);
@@ -397,11 +397,11 @@ wifi_osi_funcs_t g_wifi_osi_funcs =
       esp_dport_access_stall_other_cpu_end,
   ._wifi_apb80m_request = wifi_apb80m_request_wrapper,
   ._wifi_apb80m_release = wifi_apb80m_release_wrapper,
-  ._phy_disable = esp_phy_disable,
-  ._phy_enable = esp_phy_enable,
+  ._phy_disable = esp_phy_disable_wrapper,
+  ._phy_enable = esp_phy_enable_wrapper,
   ._phy_common_clock_enable = esp_phy_enable_clock,
   ._phy_common_clock_disable = esp_phy_disable_clock,
-  ._phy_update_country_info = esp_phy_update_country_info,
+  ._phy_update_country_info = esp_phy_update_country_info_wrapper,
   ._read_mac = esp_wifi_read_mac,
   ._timer_arm = esp_timer_arm,
   ._timer_disarm = esp_timer_disarm,
@@ -2137,7 +2137,7 @@ static inline void phy_update_wifi_mac_time(bool en_clock_stopped,
 }
 
 /****************************************************************************
- * Name: esp_phy_enable
+ * Name: esp_phy_enable_wrapper
  *
  * Description:
  *   Deinitialize PHY hardware
@@ -2150,7 +2150,7 @@ static inline void phy_update_wifi_mac_time(bool en_clock_stopped,
  *
  ****************************************************************************/
 
-static void esp_phy_disable(void)
+static void esp_phy_disable_wrapper(void)
 {
   irqstate_t flags;
   flags = enter_critical_section();
@@ -2180,7 +2180,7 @@ static void esp_phy_disable(void)
 }
 
 /****************************************************************************
- * Name: esp_phy_enable
+ * Name: esp_phy_enable_wrapper
  *
  * Description:
  *   Initialize PHY hardware
@@ -2193,7 +2193,7 @@ static void esp_phy_disable(void)
  *
  ****************************************************************************/
 
-static void esp_phy_enable(void)
+static void esp_phy_enable_wrapper(void)
 {
   irqstate_t flags;
   esp_phy_calibration_data_t *cal_data;
@@ -2292,14 +2292,14 @@ void esp_phy_disable_clock(void)
 }
 
 /****************************************************************************
- * Name: esp_phy_update_country_info
+ * Name: esp_phy_update_country_info_wrapper
  *
  * Description:
  *   Don't support
  *
  ****************************************************************************/
 
-static int32_t esp_phy_update_country_info(const char *country)
+static int32_t esp_phy_update_country_info_wrapper(const char *country)
 {
   return 0;
 }
